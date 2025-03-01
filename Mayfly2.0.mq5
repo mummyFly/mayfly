@@ -4,7 +4,7 @@
 //+------------------------------------------------------------------+
 #property copyright "xAI Grok"
 #property link      "https://xai.com"
-#property version   "2.8.5.0"
+#property version   "2.8.5.4"
 
 #include <Trade\Trade.mqh>
 
@@ -15,22 +15,30 @@ enum ENUM_TRADE_MODE
    TRADE_MODE_PERCENT = 1 // 资金百分比模式
 };
 
+// 网格结构
+struct GridStructure
+{
+   double basePrice;          // 基准价格
+   double upperBound;         // 上边界
+   double lowerBound;         // 下边界
+   double upperGrid[];        // 上方网格价格数组
+   double lowerGrid[];        // 下方网格价格数组
+};
+
 // 输入参数
-input int ATR_Period = 14;            // ATR周期
-input ENUM_TRADE_MODE TradeMode = TRADE_MODE_FIXED; // 开仓模式
-input double LotSize = 0.1;           // 固定手数（TradeMode = 0时启用）
-input double StopLossPercent = 5.0;   // 每笔订单最大损失占账户余额的百分比，默认5%
 input double GridSpacing = -1;        // 网格间距（点数），-1表示使用ATR
-input int GridLevels = 5;             // 网格数量（上下各多少格），默认5
-input int MarketOpenHour = 0;         // 开盘时间（小时，0-23），默认00:00
-input int MarketCloseHour = 24;       // 收盘时间（小时，0-24），默认24:00
-input double InputBasePrice = 0;      // 用户手动输入的基准价格，默认0表示未输入
+input double LotSize = 0.1;           // 固定手数（TradeMode = 0时启用）
+input int GridLevels = 20;            // 网格数量（上下各多少格），默认20
 input int StartHour = 15;             // 开始交易时间（小时，0-23），默认15点
 input int EndHour = 20;               // 结束交易时间（小时，0-23），默认20点
+input int ATR_Period = 14;            // ATR周期
+input ENUM_TRADE_MODE TradeMode = TRADE_MODE_FIXED; // 开仓模式
+input double StopLossPercent = 5.0;   // 每笔订单最大损失占账户余额的百分比，默认5%
+input double InputBasePrice = 0;      // 用户手动输入的基准价格，默认0表示未输入
 input bool EnableMirror = false;      // 是否开启镜像逻辑，默认关闭
 
 // 全局变量
-double BasePrice;                     // 网格基准值
+GridStructure grid;                   // 网格对象
 double GridStep;                      // 网格间距
 CTrade trade;                         // 交易对象
 double atrValue;                      // 当前ATR值
@@ -88,11 +96,11 @@ int OnInit()
    if(InputBasePrice == 0)
    {
       double multiplier = MathPow(10, precisionDigits + 1);
-      BasePrice = NormalizeDouble(MathFloor(currentPrice * multiplier) / multiplier, precisionDigits);
+      grid.basePrice = NormalizeDouble(MathFloor(currentPrice * multiplier) / multiplier, precisionDigits);
    }
    else
    {
-      BasePrice = NormalizeDouble(InputBasePrice, precisionDigits);
+      grid.basePrice = NormalizeDouble(InputBasePrice, precisionDigits);
    }
    
    if(GridSpacing > 0)
@@ -104,6 +112,18 @@ int OnInit()
       atrValue = GetATRValue(_Symbol, PERIOD_H1, ATR_Period);
       GridStep = NormalizeDouble(atrValue > 0 ? atrValue * 2.0 : 0.01, precisionDigits);
    }
+   
+   // 初始化网格对象
+   ArrayResize(grid.upperGrid, GridLevels);
+   ArrayResize(grid.lowerGrid, GridLevels);
+   for(int i = 0; i < GridLevels; i++)
+   {
+      grid.upperGrid[i] = NormalizeDouble(grid.basePrice + (i + 1) * GridStep, precisionDigits);
+      grid.lowerGrid[i] = NormalizeDouble(grid.basePrice - (i + 1) * GridStep, precisionDigits);
+   }
+   grid.upperBound = grid.upperGrid[GridLevels - 1];
+   grid.lowerBound = grid.lowerGrid[GridLevels - 1];
+   Print("网格初始化完成，上边界=", grid.upperBound, "，下边界=", grid.lowerBound);
    
    trade.SetExpertMagicNumber(MAGIC_NUMBER);
    Print("Mayfly 2.0 初始化完成，主人，准备好啦！镜像模式=", EnableMirror ? "开启" : "关闭");
@@ -157,9 +177,6 @@ void OnTick()
       return;  // 不在交易时间内，跳过后续逻辑
    }
 
-   if(IsTradingTimeRestricted(currentTime))
-      return;
-
    stopLossDetected = false;
 
    if(GlobalVariableGet(EXIT_SIGNAL) == 1)
@@ -180,14 +197,21 @@ void OnTick()
    }
 
    int shift = 0;
-   if(bidPrice >= BasePrice + GridStep)
-      shift = (int)MathFloor((bidPrice - BasePrice) / GridStep);
-   else if(bidPrice <= BasePrice - GridStep)
-      shift = (int)MathCeil((bidPrice - BasePrice) / GridStep);
+   if(bidPrice >= grid.basePrice + GridStep)
+      shift = (int)MathFloor((bidPrice - grid.basePrice) / GridStep);
+   else if(bidPrice <= grid.basePrice - GridStep)
+      shift = (int)MathCeil((bidPrice - grid.basePrice) / GridStep);
 
    if(shift != 0)
    {
-      BasePrice = NormalizeDouble(BasePrice + shift * GridStep, precisionDigits);
+      grid.basePrice = NormalizeDouble(grid.basePrice + shift * GridStep, precisionDigits);
+      for(int i = 0; i < GridLevels; i++)
+      {
+         grid.upperGrid[i] = NormalizeDouble(grid.basePrice + (i + 1) * GridStep, precisionDigits);
+         grid.lowerGrid[i] = NormalizeDouble(grid.basePrice - (i + 1) * GridStep, precisionDigits);
+      }
+      grid.upperBound = grid.upperGrid[GridLevels - 1];
+      grid.lowerBound = grid.lowerGrid[GridLevels - 1];
       AdjustGridOrders();
       DrawBasePriceLine();
    }
@@ -213,10 +237,10 @@ void CheckAndReplenishOrders()
    bool allowBuy = !stopLossDetected || lastStopLossType != POSITION_TYPE_SELL;
    bool allowSell = !stopLossDetected || lastStopLossType != POSITION_TYPE_BUY;
 
-   for(int i = 1; i <= GridLevels; i++)
+   for(int i = 0; i < GridLevels; i++)
    {
-      double buyPrice = NormalizeDouble(BasePrice + i * GridStep, precisionDigits);
-      double sellPrice = NormalizeDouble(BasePrice - i * GridStep, precisionDigits);
+      double buyPrice = grid.upperGrid[i];
+      double sellPrice = grid.lowerGrid[i];
       double lotSizeBuy = CalculateLotSize(GridStep, buyPrice);
       double lotSizeSell = CalculateLotSize(GridStep, sellPrice);
 
@@ -316,7 +340,7 @@ void DrawBasePriceLine()
 {
    ObjectDelete(0, "BasePriceLine");
    
-   ObjectCreate(0, "BasePriceLine", OBJ_HLINE, 0, 0, BasePrice);
+   ObjectCreate(0, "BasePriceLine", OBJ_HLINE, 0, 0, grid.basePrice);
    ObjectSetInteger(0, "BasePriceLine", OBJPROP_COLOR, clrRed);
    ObjectSetInteger(0, "BasePriceLine", OBJPROP_STYLE, STYLE_SOLID);
    ObjectSetInteger(0, "BasePriceLine", OBJPROP_WIDTH, 1);
@@ -346,34 +370,6 @@ ulong GetLastDealTicket()
 }
 
 //+------------------------------------------------------------------+
-//| 检查是否在限制时间段内                                            |
-//+------------------------------------------------------------------+
-bool IsTradingTimeRestricted(datetime currentTime)
-{
-   MqlDateTime timeStruct;
-   TimeToStruct(currentTime, timeStruct);
-   int hour = timeStruct.hour;
-   int minute = timeStruct.min;
-   
-   int closeMinutes = MarketCloseHour * 60;
-   int currentMinutes = hour * 60 + minute;
-   int closeStart = (closeMinutes - 10 + 1440) % 1440;
-   
-   int openEnd = (MarketOpenHour + 1) % 24;
-   
-   if(closeMinutes <= closeStart)
-   {
-      return (currentMinutes >= closeStart || currentMinutes < closeMinutes) || 
-             (hour >= MarketOpenHour && hour < openEnd);
-   }
-   else
-   {
-      return (currentMinutes >= closeStart && currentMinutes < closeMinutes) || 
-             (hour >= MarketOpenHour && hour < openEnd);
-   }
-}
-
-//+------------------------------------------------------------------+
 //| 设置初始网格订单                                                  |
 //+------------------------------------------------------------------+
 void SetupGridOrders()
@@ -389,10 +385,10 @@ void SetupGridOrders()
    bool allowBuy = !stopLossDetected || lastStopLossType != POSITION_TYPE_SELL;
    bool allowSell = !stopLossDetected || lastStopLossType != POSITION_TYPE_BUY;
 
-   for(int i = 1; i <= GridLevels; i++)
+   for(int i = 0; i < GridLevels; i++)
    {
-      double buyPrice = NormalizeDouble(BasePrice + i * GridStep, precisionDigits);
-      double sellPrice = NormalizeDouble(BasePrice - i * GridStep, precisionDigits);
+      double buyPrice = grid.upperGrid[i];
+      double sellPrice = grid.lowerGrid[i];
       double lotSizeBuy = CalculateLotSize(GridStep, buyPrice);
       double lotSizeSell = CalculateLotSize(GridStep, sellPrice);
 
@@ -451,8 +447,7 @@ void AdjustGridOrders()
          if(OrderGetString(ORDER_SYMBOL) == _Symbol && 
             OrderGetInteger(ORDER_MAGIC) == MAGIC_NUMBER)
          {
-            if(orderPrice > BasePrice + GridLevels * GridStep || 
-               orderPrice < BasePrice - GridLevels * GridStep)
+            if(orderPrice > grid.upperBound || orderPrice < grid.lowerBound)
             {
                trade.OrderDelete(ticket);
             }
@@ -463,10 +458,10 @@ void AdjustGridOrders()
    bool allowBuy = !stopLossDetected || lastStopLossType != POSITION_TYPE_SELL;
    bool allowSell = !stopLossDetected || lastStopLossType != POSITION_TYPE_BUY;
 
-   for(int i = 1; i <= GridLevels; i++)
+   for(int i = 0; i < GridLevels; i++)
    {
-      double buyPrice = NormalizeDouble(BasePrice + i * GridStep, precisionDigits);
-      double sellPrice = NormalizeDouble(BasePrice - i * GridStep, precisionDigits);
+      double buyPrice = grid.upperGrid[i];
+      double sellPrice = grid.lowerGrid[i];
       double lotSizeBuy = CalculateLotSize(GridStep, buyPrice);
       double lotSizeSell = CalculateLotSize(GridStep, sellPrice);
 
