@@ -1,0 +1,589 @@
+//+------------------------------------------------------------------+
+//| Expert Advisor: Mayfly 2.0 System                                |
+//| Description: Pre-set Stop Order Grid Trading System with Dynamic Base Price |
+//+------------------------------------------------------------------+
+#property copyright "xAI Grok"
+#property link      "https://xai.com"
+#property version   "2.8.3"  // 当前版本号
+
+#include <Trade\Trade.mqh>
+
+// 开仓模式枚举
+enum ENUM_TRADE_MODE
+{
+   TRADE_MODE_FIXED = 0,  // 固定手数模式
+   TRADE_MODE_PERCENT = 1 // 资金百分比模式
+};
+
+// 输入参数
+input int ATR_Period = 14;            // ATR周期
+input ENUM_TRADE_MODE TradeMode = TRADE_MODE_FIXED; // 开仓模式
+input double LotSize = 0.1;           // 固定手数（TradeMode = 0时启用）
+input double StopLossPercent = 5.0;   // 每笔订单最大损失占账户余额的百分比，默认5%
+input double GridSpacing = -1;        // 网格间距（点数），-1表示使用ATR
+input int GridLevels = 5;             // 网格数量（上下各多少格），默认5
+input int MarketOpenHour = 0;         // 开盘时间（小时，0-23），默认00:00
+input int MarketCloseHour = 24;       // 收盘时间（小时，0-24），默认24:00
+input double InputBasePrice = 0;      // 用户手动输入的基准价格，默认0表示未输入
+
+// 全局变量
+double BasePrice;                     // 网格基准值
+double GridStep;                      // 网格间距
+CTrade trade;                         // 交易对象
+double atrValue;                      // 当前ATR值
+ulong lastDealTicket = 0;             // 最后处理的成交票号
+int precisionDigits;                  // 计算精度（比市场精度多一位）
+const long MAGIC_NUMBER = StringToInteger("Mayfly2.0");  // 魔术号
+string EXIT_SIGNAL;                   // 退出信号全局变量名称（图表特定）
+string CLEANUP_DONE;                  // 清理完成标志全局变量名称（图表特定）
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                    |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   if(!AccountInfoInteger(ACCOUNT_TRADE_ALLOWED))
+   {
+      Print("账户不允许交易");
+      return(INIT_FAILED);
+   }
+   if(!SymbolInfoInteger(_Symbol, SYMBOL_TRADE_MODE) != SYMBOL_TRADE_MODE_DISABLED)
+   {
+      Print("市场未开放");
+      return(INIT_FAILED);
+   }
+   
+   // 生成图表特定的全局变量名称，包含交易品种和周期
+   long chartId = ChartID();
+   string timeframe = EnumToString(_Period);
+   EXIT_SIGNAL = "Mayfly2.0_" + _Symbol + "_" + timeframe + "_Exit_" + IntegerToString(chartId);
+   CLEANUP_DONE = "Mayfly2.0_" + _Symbol + "_" + timeframe + "_CleanupDone_" + IntegerToString(chartId);
+   
+   // 初始化时取消所有挂单
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(OrderSelect(ticket))
+      {
+         if(OrderGetString(ORDER_SYMBOL) == _Symbol && OrderGetInteger(ORDER_MAGIC) == MAGIC_NUMBER)
+         {
+            trade.OrderDelete(ticket);
+         }
+      }
+   }
+   
+   // 重置图表特定的退出信号和清理标志
+   GlobalVariableSet(EXIT_SIGNAL, 0);
+   if(GlobalVariableCheck(CLEANUP_DONE))
+      GlobalVariableDel(CLEANUP_DONE);
+   
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   precisionDigits = (int)MathCeil(-MathLog10(point)) - 1;
+   double currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   
+   if(InputBasePrice == 0)
+   {
+      double multiplier = MathPow(10, precisionDigits + 1);
+      BasePrice = NormalizeDouble(MathFloor(currentPrice * multiplier) / multiplier, precisionDigits);
+   }
+   else
+   {
+      BasePrice = NormalizeDouble(InputBasePrice, precisionDigits);
+   }
+   
+   if(GridSpacing > 0)
+   {
+      GridStep = NormalizeDouble(GridSpacing * point, precisionDigits);
+   }
+   else
+   {
+      atrValue = GetATRValue(_Symbol, PERIOD_H1, ATR_Period);
+      GridStep = NormalizeDouble(atrValue > 0 ? atrValue * 2.0 : 0.01, precisionDigits);
+   }
+   
+   trade.SetExpertMagicNumber(MAGIC_NUMBER);
+   Print("Mayfly 2.0 初始化完成");
+   
+   SetupGridOrders();
+   DrawBasePriceLine();
+   lastDealTicket = GetLastDealTicket();
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                  |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   if(!GlobalVariableCheck(CLEANUP_DONE) || GlobalVariableGet(CLEANUP_DONE) != 1)
+   {
+      CleanupOrders();
+   }
+   ObjectDelete(0, "BasePriceLine");
+   Print("Mayfly 2.0 停止运行，原因代码=", reason);
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                              |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   datetime currentTime = TimeCurrent();
+   if(IsTradingTimeRestricted(currentTime))
+      return;
+
+   if(GlobalVariableGet(EXIT_SIGNAL) == 1)
+   {
+      Print("检测到退出信号，清理订单并移除 EA");
+      CleanupOrders();
+      ExpertRemove();
+      return;
+   }
+
+   double bidPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   ulong currentDealTicket = GetLastDealTicket();
+   if(currentDealTicket > lastDealTicket)
+   {
+      UpdateStopLosses();
+      lastDealTicket = currentDealTicket;
+   }
+
+   int shift = 0;
+   if(bidPrice >= BasePrice + GridStep)
+      shift = (int)MathFloor((bidPrice - BasePrice) / GridStep);
+   else if(bidPrice <= BasePrice - GridStep)
+      shift = (int)MathCeil((bidPrice - BasePrice) / GridStep);
+
+   if(shift != 0)
+   {
+      BasePrice = NormalizeDouble(BasePrice + shift * GridStep, precisionDigits);
+      AdjustGridOrders();
+      DrawBasePriceLine();
+   }
+
+   CancelOrdersMatchingStopLoss();
+}
+
+//+------------------------------------------------------------------+
+//| 清理所有挂单                                                      |
+//+------------------------------------------------------------------+
+void CleanupOrders()
+{
+   Print("正在清理订单...");
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(OrderSelect(ticket))
+      {
+         if(OrderGetString(ORDER_SYMBOL) == _Symbol && OrderGetInteger(ORDER_MAGIC) == MAGIC_NUMBER)
+         {
+            if(trade.OrderDelete(ticket))
+               Print("已删除订单 ", ticket);
+            else
+               Print("删除订单失败，票号=", ticket, "，错误代码=", GetLastError());
+         }
+      }
+   }
+   GlobalVariableSet(CLEANUP_DONE, 1);
+   GlobalVariableSet(EXIT_SIGNAL, 0);
+   Print("清理完成");
+}
+
+//+------------------------------------------------------------------+
+//| 绘制基准价格线                                                    |
+//+------------------------------------------------------------------+
+void DrawBasePriceLine()
+{
+   ObjectDelete(0, "BasePriceLine");
+   
+   ObjectCreate(0, "BasePriceLine", OBJ_HLINE, 0, 0, BasePrice);
+   ObjectSetInteger(0, "BasePriceLine", OBJPROP_COLOR, clrRed);
+   ObjectSetInteger(0, "BasePriceLine", OBJPROP_STYLE, STYLE_SOLID);
+   ObjectSetInteger(0, "BasePriceLine", OBJPROP_WIDTH, 1);
+   ObjectSetInteger(0, "BasePriceLine", OBJPROP_BACK, false);
+}
+
+//+------------------------------------------------------------------+
+//| 获取最新成交票号                                                  |
+//+------------------------------------------------------------------+
+ulong GetLastDealTicket()
+{
+   if(!HistorySelect(TimeCurrent() - 3600, TimeCurrent()))
+      return lastDealTicket;
+
+   int totalDeals = HistoryDealsTotal();
+   for(int i = totalDeals - 1; i >= 0; i--)
+   {
+      ulong dealTicket = HistoryDealGetTicket(i);
+      if(dealTicket > 0 && HistoryDealGetString(dealTicket, DEAL_SYMBOL) == _Symbol && 
+         HistoryDealGetInteger(dealTicket, DEAL_MAGIC) == MAGIC_NUMBER &&
+         HistoryDealGetInteger(dealTicket, DEAL_ENTRY) == DEAL_ENTRY_IN)
+      {
+         return dealTicket;
+      }
+   }
+   return lastDealTicket;
+}
+
+//+------------------------------------------------------------------+
+//| 检查是否在限制时间段内                                            |
+//+------------------------------------------------------------------+
+bool IsTradingTimeRestricted(datetime currentTime)
+{
+   MqlDateTime timeStruct;
+   TimeToStruct(currentTime, timeStruct);
+   int hour = timeStruct.hour;
+   int minute = timeStruct.min;
+   
+   int closeMinutes = MarketCloseHour * 60;
+   int currentMinutes = hour * 60 + minute;
+   int closeStart = (closeMinutes - 10 + 1440) % 1440;
+   
+   int openEnd = (MarketOpenHour + 1) % 24;
+   
+   if(closeMinutes <= closeStart)
+   {
+      return (currentMinutes >= closeStart || currentMinutes < closeMinutes) || 
+             (hour >= MarketOpenHour && hour < openEnd);
+   }
+   else
+   {
+      return (currentMinutes >= closeStart && currentMinutes < closeMinutes) || 
+             (hour >= MarketOpenHour && hour < openEnd);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| 检查价格是否与持仓止损重合                                        |
+//+------------------------------------------------------------------+
+bool IsPriceMatchingStopLoss(double price)
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(PositionSelectByTicket(PositionGetTicket(i)))
+      {
+         if(PositionGetString(POSITION_SYMBOL) == _Symbol && 
+            PositionGetInteger(POSITION_MAGIC) == MAGIC_NUMBER)
+         {
+            double slPrice = NormalizeDouble(PositionGetDouble(POSITION_SL), precisionDigits);
+            if(price == slPrice)
+               return true;
+         }
+      }
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| 设置初始网格订单                                                  |
+//+------------------------------------------------------------------+
+void SetupGridOrders()
+{
+   int totalPositions = PositionsTotal();
+
+   if(totalPositions >= GridLevels)
+   {
+      Print("持仓已达上限=", GridLevels, "，停止挂单");
+      return;
+   }
+
+   for(int i = 1; i <= GridLevels; i++)
+   {
+      double buyPrice = NormalizeDouble(BasePrice + i * GridStep, precisionDigits);
+      double slPrice = NormalizeDouble(buyPrice - GridStep, precisionDigits);
+      double lotSize = CalculateLotSize(GridStep, buyPrice);
+
+      if(lotSize > 0 && !OrderExists(buyPrice, ORDER_TYPE_BUY_STOP) && !IsPriceMatchingStopLoss(buyPrice))
+      {
+         trade.BuyStop(lotSize, buyPrice, _Symbol, slPrice, 0, ORDER_TIME_GTC, 0, "Buy Stop Grid");
+      }
+
+      double sellPrice = NormalizeDouble(BasePrice - i * GridStep, precisionDigits);
+      slPrice = NormalizeDouble(sellPrice + GridStep, precisionDigits);
+      lotSize = CalculateLotSize(GridStep, sellPrice);
+
+      if(lotSize > 0 && !OrderExists(sellPrice, ORDER_TYPE_SELL_STOP) && !IsPriceMatchingStopLoss(sellPrice))
+      {
+         trade.SellStop(lotSize, sellPrice, _Symbol, slPrice, 0, ORDER_TIME_GTC, 0, "Sell Stop Grid");
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| 调整网格订单                                                      |
+//+------------------------------------------------------------------+
+void AdjustGridOrders()
+{
+   int totalPositions = PositionsTotal();
+
+   if(totalPositions >= GridLevels)
+   {
+      Print("持仓已达上限=", GridLevels, "，停止调整网格");
+      return;
+   }
+
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(OrderSelect(ticket))
+      {
+         double orderPrice = OrderGetDouble(ORDER_PRICE_OPEN);
+         if(OrderGetString(ORDER_SYMBOL) == _Symbol && 
+            OrderGetInteger(ORDER_MAGIC) == MAGIC_NUMBER)
+         {
+            if(orderPrice > BasePrice + GridLevels * GridStep || 
+               orderPrice < BasePrice - GridLevels * GridStep)
+            {
+               trade.OrderDelete(ticket);
+            }
+         }
+      }
+   }
+
+   for(int i = 1; i <= GridLevels; i++)
+   {
+      double buyPrice = NormalizeDouble(BasePrice + i * GridStep, precisionDigits);
+      double slPrice = NormalizeDouble(buyPrice - GridStep, precisionDigits);
+      double lotSize = CalculateLotSize(GridStep, buyPrice);
+
+      if(lotSize > 0 && !OrderExists(buyPrice, ORDER_TYPE_BUY_STOP) && !PositionExists(buyPrice) && !IsPriceMatchingStopLoss(buyPrice))
+      {
+         trade.BuyStop(lotSize, buyPrice, _Symbol, slPrice, 0, ORDER_TIME_GTC, 0, "Buy Stop Grid");
+      }
+
+      double sellPrice = NormalizeDouble(BasePrice - i * GridStep, precisionDigits);
+      slPrice = NormalizeDouble(sellPrice + GridStep, precisionDigits);
+      lotSize = CalculateLotSize(GridStep, sellPrice);
+
+      if(lotSize > 0 && !OrderExists(sellPrice, ORDER_TYPE_SELL_STOP) && !PositionExists(sellPrice) && !IsPriceMatchingStopLoss(sellPrice))
+      {
+         trade.SellStop(lotSize, sellPrice, _Symbol, slPrice, 0, ORDER_TIME_GTC, 0, "Sell Stop Grid");
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| 更新所有持仓止损（原有逻辑）                                      |
+//+------------------------------------------------------------------+
+void UpdateStopLosses()
+{
+   int updated = 0;
+   double lastBuyStopLoss = 0;
+   double lastSellStopLoss = 0;
+   datetime latestTime = 0;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(PositionSelectByTicket(PositionGetTicket(i)))
+      {
+         if(PositionGetString(POSITION_SYMBOL) == _Symbol && 
+            PositionGetInteger(POSITION_MAGIC) == MAGIC_NUMBER)
+         {
+            datetime openTime = (datetime)PositionGetInteger(POSITION_TIME);
+            if(openTime > latestTime)
+            {
+               latestTime = openTime;
+               double slPrice = PositionGetDouble(POSITION_SL);
+               if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+                  lastBuyStopLoss = slPrice;
+               else
+                  lastSellStopLoss = slPrice;
+            }
+         }
+      }
+   }
+
+   if(lastBuyStopLoss > 0 || lastSellStopLoss > 0)
+   {
+      for(int i = PositionsTotal() - 1; i >= 0; i--)
+      {
+         if(PositionSelectByTicket(PositionGetTicket(i)))
+         {
+            if(PositionGetString(POSITION_SYMBOL) == _Symbol && 
+               PositionGetInteger(POSITION_MAGIC) == MAGIC_NUMBER)
+            {
+               if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY && lastBuyStopLoss > 0)
+               {
+                  double newSlPrice = NormalizeDouble(lastBuyStopLoss, precisionDigits);
+                  if(newSlPrice != PositionGetDouble(POSITION_SL))
+                  {
+                     if(trade.PositionModify(PositionGetTicket(i), newSlPrice, 0))
+                        updated++;
+                  }
+               }
+               else if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL && lastSellStopLoss > 0)
+               {
+                  double newSlPrice = NormalizeDouble(lastSellStopLoss, precisionDigits);
+                  if(newSlPrice != PositionGetDouble(POSITION_SL))
+                  {
+                     if(trade.PositionModify(PositionGetTicket(i), newSlPrice, 0))
+                        updated++;
+                  }
+               }
+            }
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| 取消与持仓止损重合的挂单                                          |
+//+------------------------------------------------------------------+
+void CancelOrdersMatchingStopLoss()
+{
+   if(PositionsTotal() == 0) return;
+
+   double stopLosses[];
+   ArrayResize(stopLosses, PositionsTotal());
+   int stopLossCount = 0;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(PositionSelectByTicket(PositionGetTicket(i)))
+      {
+         if(PositionGetString(POSITION_SYMBOL) == _Symbol && 
+            PositionGetInteger(POSITION_MAGIC) == MAGIC_NUMBER)
+         {
+            stopLosses[stopLossCount] = NormalizeDouble(PositionGetDouble(POSITION_SL), precisionDigits);
+            stopLossCount++;
+         }
+      }
+   }
+
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(OrderSelect(ticket))
+      {
+         double orderPrice = OrderGetDouble(ORDER_PRICE_OPEN);
+         if(OrderGetString(ORDER_SYMBOL) == _Symbol && 
+            OrderGetInteger(ORDER_MAGIC) == MAGIC_NUMBER)
+         {
+            for(int j = 0; j < stopLossCount; j++)
+            {
+               if(orderPrice == stopLosses[j])
+               {
+                  trade.OrderDelete(ticket);
+                  break;
+               }
+            }
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| 检查订单是否已存在                                                |
+//+------------------------------------------------------------------+
+bool OrderExists(double price, ENUM_ORDER_TYPE orderType)
+{
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(OrderSelect(ticket))
+      {
+         if(OrderGetString(ORDER_SYMBOL) == _Symbol && 
+            OrderGetInteger(ORDER_TYPE) == orderType && 
+            NormalizeDouble(OrderGetDouble(ORDER_PRICE_OPEN), precisionDigits) == NormalizeDouble(price, precisionDigits))
+         {
+            return true;
+         }
+      }
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| 检查持仓是否已存在                                                |
+//+------------------------------------------------------------------+
+bool PositionExists(double price)
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(PositionSelectByTicket(PositionGetTicket(i)))
+      {
+         if(PositionGetString(POSITION_SYMBOL) == _Symbol && 
+            PositionGetInteger(POSITION_MAGIC) == MAGIC_NUMBER && 
+            NormalizeDouble(PositionGetDouble(POSITION_PRICE_OPEN), precisionDigits) == NormalizeDouble(price, precisionDigits))
+         {
+            return true;
+         }
+      }
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| 计算手数函数                                                      |
+//+------------------------------------------------------------------+
+double CalculateLotSize(double stopLossDistance, double price)
+{
+   if(TradeMode == TRADE_MODE_FIXED)
+      return NormalizeDouble(LotSize, 2);
+
+   double accountBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   if(accountBalance <= 0)
+      return 0;
+
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(tickValue == 0 || tickSize == 0)
+      return 0;
+
+   double leverage = (double)AccountInfoInteger(ACCOUNT_LEVERAGE);
+   if(leverage <= 0) leverage = 100;
+   
+   double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   double contractSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_CONTRACT_SIZE);
+   double marginPerLot = (contractSize * price) / leverage;
+   double maxLotByMargin = freeMargin / marginPerLot;
+
+   double riskAmount = accountBalance * (StopLossPercent / 100.0);
+   double lotSize = riskAmount / (stopLossDistance / tickSize * tickValue);
+   
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   
+   lotSize = MathMin(lotSize, maxLotByMargin);
+   lotSize = MathMax(minLot, MathMin(maxLot, lotSize));
+   lotSize = MathRound(lotSize / lotStep) * lotStep;
+   lotSize = NormalizeDouble(lotSize, 2);
+
+   if(lotSize <= 0 || lotSize * marginPerLot > freeMargin)
+      return 0;
+
+   return lotSize;
+}
+
+//+------------------------------------------------------------------+
+//| 获取ATR值函数                                                     |
+//+------------------------------------------------------------------+
+double GetATRValue(string symbol, ENUM_TIMEFRAMES timeframe, int period)
+{
+   MqlRates rates[];
+   if(CopyRates(symbol, timeframe, 0, period + 1, rates) < period + 1)
+      return 0;
+
+   double atrArray[];
+   ArraySetAsSeries(atrArray, true);
+   int atrHandle = iATR(symbol, timeframe, period);
+   if(atrHandle == INVALID_HANDLE)
+      return 0;
+
+   int retries = 3;
+   for(int i = 0; i < retries; i++)
+   {
+      if(CopyBuffer(atrHandle, 0, 0, 1, atrArray) > 0)
+      {
+         IndicatorRelease(atrHandle);
+         return atrArray[0];
+      }
+      Sleep(100);
+   }
+
+   IndicatorRelease(atrHandle);
+   return 0;
+}
+//+------------------------------------------------------------------+
