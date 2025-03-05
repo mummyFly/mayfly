@@ -1,25 +1,13 @@
 //+------------------------------------------------------------------+
-//| Expert Advisor: Mayfly 4.0.7 (Main File)                        |
+//| Expert Advisor: Mayfly 4.1.0 (Main File)                       |
 //| Description: Core Pre-set Stop Order Grid Trading System        |
 //+------------------------------------------------------------------+
 #property copyright "xAI Grok"
 #property link      "https://xai.com"
-#property version   "4.0.7"
+#property version   "4.1.0"
 
 #include <Trade\Trade.mqh>
 #include "Mayfly_Advanced_4_0_7.mqh"
-
-// 开仓模式枚举（仅保留固定手数模式）
-enum ENUM_TRADE_MODE
-{
-   TRADE_MODE_FIXED = 0 // 固定手数模式
-};
-
-// 加仓模式枚举（仅保留均匀加仓模式）
-enum ENUM_ADD_MODE
-{
-   ADD_MODE_UNIFORM = 0 // 匀速加仓（默认）
-};
 
 // 网格结构定义
 struct GridStructure
@@ -54,6 +42,8 @@ input int ActiveZoneEndHour = 22;     // 活跃时区结束时间
 input int ATR_Period = 14;            // ATR 计算周期
 input ENUM_TRADE_MODE TradeMode = TRADE_MODE_FIXED; // 开仓模式
 input bool IsMiniLot = true;          // 是否使用迷你手
+input double PositionPercent = 5.0;   // 百分比开仓占比
+input double StopLossPercent = 5.0;   // 止损比例占比
 input double InputBasePrice = 0;      // 手动基准价格
 input double SlippageTolerance = 0.5; // 滑点容忍范围
 input bool EnableMirror = false;      // 镜像逻辑
@@ -61,6 +51,7 @@ input bool EnableLogging = false;     // 日志记录
 input ENUM_ADD_MODE AddPositionMode = ADD_MODE_UNIFORM; // 加仓模式
 input double MaxTotalLots = 100.0;    // 最大总手数
 input int AddPositionTimes = 10;      // 最大加仓次数
+input bool EnableDynamicGrid = false; // 动态网格
 input double AbnormalStopLossMultiplier = 3.0; // 异常止损倍数
 
 // 全局变量
@@ -75,17 +66,18 @@ string CLEANUP_DONE;
 ENUM_POSITION_TYPE lastStopLossType = POSITION_TYPE_BUY;
 bool stopEventDetected = false;
 bool hasCleanedUpAfterEnd = false;
-double lastStopLossPrice = 0;
+double lastOrderSLPrice = 0;    // 最新订单止损价
+double lastPositionSLPrice;     // 最新持仓订单的止损价，初始化在 OnInit
 double lastBidPrice = 0;
 double lastBuyStopLoss = 0;
 double lastSellStopLoss = 0;
 PositionInfo positionsInfo[];
 datetime lastGridUpdateTime = 0;
+datetime lastAbnormalCheckTime = 0; // 记录上次异常止损检查时间
 bool lastActiveZoneState = false;
 bool isFirstTick = true;
-bool positionsChanged = true;
+bool positionsChanged = true; // 初始为 true，确保首次运行时检查
 bool ordersChanged = true;
-double lastProcessedBidPrice = 0;
 int gridOccupancyMap[];
 
 // 缓存变量
@@ -99,50 +91,293 @@ double cachedSymbolPoint;
 double cachedBidPrice;
 
 //+------------------------------------------------------------------+
-//| 自定义日志函数                                                    |
+//| MQL 自带方法                                                    |
 //+------------------------------------------------------------------+
-void Log(string message)
-{
-   if(EnableLogging) Print(message);
-}
 
-//+------------------------------------------------------------------+
-//| 判断价格是否与最新止损/止盈重合                                  |
-//+------------------------------------------------------------------+
-bool IsPriceAtStopLoss(double price)
+// 初始化函数
+int OnInit()
 {
-   double normalizedPrice = NormalizeDouble(price, precisionDigits);
-   return (normalizedPrice == NormalizeDouble(lastBuyStopLoss, precisionDigits) || 
-           normalizedPrice == NormalizeDouble(lastSellStopLoss, precisionDigits));
-}
-
-//+------------------------------------------------------------------+
-//| 检查异常止损情况                                                  |
-//+------------------------------------------------------------------+
-void CheckAbnormalStopLoss()
-{
-   if(lastStopLossPrice == 0)
+   if(!AccountInfoInteger(ACCOUNT_TRADE_ALLOWED))
    {
-      Log("跳过异常止损检查：lastStopLossPrice 未设置");
+      Log("初始化失败：账户不允许交易");
+      return(INIT_FAILED);
+   }
+
+   if(SymbolInfoInteger(_Symbol, SYMBOL_TRADE_MODE) == SYMBOL_TRADE_MODE_DISABLED)
+   {
+      Log("初始化失败：市场未开放");
+      return(INIT_FAILED);
+   }
+
+   long chartId = ChartID();
+   string timeframe = EnumToString(_Period);
+   EXIT_SIGNAL = "Mayfly_" + _Symbol + "_" + timeframe + "_Exit_" + IntegerToString(chartId);
+   CLEANUP_DONE = "Mayfly_" + _Symbol + "_" + timeframe + "_CleanupDone_" + IntegerToString(chartId);
+
+   CleanupOrders();
+   GlobalVariableSet(EXIT_SIGNAL, 0);
+   if(GlobalVariableCheck(CLEANUP_DONE)) GlobalVariableDel(CLEANUP_DONE);
+
+   cachedSymbolPoint = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   precisionDigits = (int)MathCeil(-MathLog10(cachedSymbolPoint)) - 1;
+   cachedBidPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   lastPositionSLPrice = cachedBidPrice; // 初始化为当前 Bid 价格
+   cachedContractSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_CONTRACT_SIZE);
+   cachedTickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   cachedTickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   cachedMinLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   cachedMaxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   cachedLotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   grid.basePrice = (InputBasePrice == 0) ? 
+                    NormalizeDouble(MathFloor(cachedBidPrice * MathPow(10, precisionDigits + 1)) / MathPow(10, precisionDigits + 1), precisionDigits) : 
+                    NormalizeDouble(InputBasePrice, precisionDigits);
+
+   grid.GridStep = (GridSpacing > 0) ? NormalizeDouble(GridSpacing * cachedSymbolPoint, precisionDigits) : 
+                   NormalizeDouble((atrValue = GetATRValue(_Symbol, _Period, ATR_Period)) > 0 ? atrValue * 2.0 : 0.01, precisionDigits);
+   grid.originalGridStep = grid.GridStep;
+
+   if(GridLevels <= 0)
+   {
+      Log("初始化失败：GridLevels 必须大于 0，当前值=" + IntegerToString(GridLevels));
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+
+   if(ArrayResize(grid.upperGrid, GridLevels) < 0 || ArrayResize(grid.lowerGrid, GridLevels) < 0)
+   {
+      Log("初始化失败：网格数组调整大小失败");
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+
+   UpdateGridLevels();
+   trade.SetExpertMagicNumber(MAGIC_NUMBER);
+   SetupGridOrders();
+   DrawBasePriceLine();
+   lastDealTicket = GetLastDealTicket();
+   lastBidPrice = cachedBidPrice;
+   lastGridUpdateTime = TimeCurrent();
+   return(INIT_SUCCEEDED);
+}
+
+// Tick 函数
+void OnTick()
+{
+   cachedBidPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   if(isFirstTick)
+   {
+      CachePositionGridPrices();
+      isFirstTick = false;
+      positionsChanged = true;
+      ordersChanged = true;
+   }
+
+   datetime currentTime = TimeCurrent();
+   MqlDateTime timeStruct;
+   TimeToStruct(currentTime, timeStruct);
+   int currentHour = timeStruct.hour;
+
+   if(currentHour < StartHour || currentHour >= EndHour)
+   {
+      if(currentHour >= EndHour && !hasCleanedUpAfterEnd)
+      {
+         Log("超出交易时间范围，执行清理并退出");
+         CloseAllPositions();
+         CleanupOrders();
+         hasCleanedUpAfterEnd = true;
+      }
       return;
    }
 
-   double priceDiff = (lastStopLossType == POSITION_TYPE_BUY) ? 
-                      (lastStopLossPrice - cachedBidPrice) : (cachedBidPrice - lastStopLossPrice);
-   if(priceDiff <= AbnormalStopLossMultiplier * grid.GridStep)
+   hasCleanedUpAfterEnd = false;
+
+   // 重置 lastPositionSLPrice
+   if(PositionsTotal() == 0)
    {
-      Log("跳过异常止损处理：价格差异 " + DoubleToString(priceDiff, precisionDigits) + 
-          " 未超过阈值 " + DoubleToString(AbnormalStopLossMultiplier * grid.GridStep, precisionDigits));
+      lastPositionSLPrice = -1;
+      Log("无持仓，重置 lastPositionSLPrice 为 -1");
+   }
+
+   HandleGridAdjustment();
+
+   // 每分钟检查异常止损
+   static datetime lastMinute = 0;
+   datetime currentMinute = currentTime / 60; // 转换为分钟时间戳
+   if(PositionsTotal() > 0 && lastPositionSLPrice != -1 && currentMinute != lastMinute)
+   {
+      CheckAbnormalStopLoss();
+      lastMinute = currentMinute;
+      lastAbnormalCheckTime = currentTime;
+   }
+
+   if(EnableDynamicGrid && currentTime - lastGridUpdateTime >= 60)
+   {
+      Log("每分钟检查动态网格更新");
+      UpdateDynamicGrid(currentHour);
+   }
+}
+
+// 反初始化函数
+void OnDeinit(const int reason)
+{
+   if(!GlobalVariableCheck(CLEANUP_DONE) || GlobalVariableGet(CLEANUP_DONE) != 1)
+   {
+      Log("执行清理：未检测到清理完成标志或值为 0");
+      CleanupOrders();
+   }
+   ObjectDelete(0, "BasePriceLine");
+   Log("Mayfly 4.1.0 停止运行，原因代码=" + IntegerToString(reason));
+}
+
+// 交易事件处理函数
+void OnTradeTransaction(const MqlTradeTransaction& trans,
+                       const MqlTradeRequest& request,
+                       const MqlTradeResult& result)
+{
+   long magic = 0;
+
+   if(trans.type == TRADE_TRANSACTION_ORDER_ADD || trans.type == TRADE_TRANSACTION_ORDER_UPDATE || 
+      trans.type == TRADE_TRANSACTION_ORDER_DELETE)
+   {
+      if(trans.type == TRADE_TRANSACTION_ORDER_DELETE)
+      {
+         Log("订单删除事件，跳过选择：orderTicket=" + IntegerToString(trans.order));
+         ordersChanged = true;
+         magic = 0;
+      }
+      else
+      {
+         if(!OrderSelect(trans.order))
+         {
+            Log("警告：无法选择订单，orderTicket=" + IntegerToString(trans.order) + 
+                ", trans.type=" + EnumToString(trans.type) + 
+                ", error=" + IntegerToString(GetLastError()));
+            return;
+         }
+         magic = OrderGetInteger(ORDER_MAGIC);
+      }
+   }
+   else if(trans.type == TRADE_TRANSACTION_DEAL_ADD || trans.type == TRADE_TRANSACTION_POSITION)
+   {
+      if(!PositionSelectByTicket(trans.position))
+      {
+         if(!HistoryDealSelect(trans.deal))
+         {
+            Log("警告：无法选择持仓或成交，dealTicket=" + IntegerToString(trans.deal));
+            return;
+         }
+         magic = HistoryDealGetInteger(trans.deal, DEAL_MAGIC);
+      }
+      else
+      {
+         magic = PositionGetInteger(POSITION_MAGIC);
+      }
+   }
+   else
+      return;
+
+   if(trans.symbol != _Symbol || magic != MAGIC_NUMBER)
+      return;
+
+   if(trans.type != TRADE_TRANSACTION_DEAL_ADD)
+   {
+      if(trans.type == TRADE_TRANSACTION_ORDER_ADD)
+         Log("订单添加：orderTicket=" + IntegerToString(trans.order));
+      else if(trans.type == TRADE_TRANSACTION_ORDER_DELETE)
+         Log("订单删除：orderTicket=" + IntegerToString(trans.order));
+      else if(trans.type == TRADE_TRANSACTION_POSITION)
+         Log("持仓更新：positionTicket=" + IntegerToString(trans.position));
+      ordersChanged = true;
+      CachePositionGridPrices();
+      positionsChanged = false;
+      ordersChanged = false;
       return;
    }
 
-   Log("检测到异常止损情况！平掉全部订单！");
-   CloseAllPositions();
+   if(!HistoryDealSelect(trans.deal))
+   {
+      Log("警告：无法选择成交历史，dealTicket=" + IntegerToString(trans.deal));
+      return;
+   }
+
+   ENUM_DEAL_REASON reason = (ENUM_DEAL_REASON)HistoryDealGetInteger(trans.deal, DEAL_REASON);
+   ENUM_DEAL_ENTRY entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+
+   if(trans.deal_type != DEAL_TYPE_BUY && trans.deal_type != DEAL_TYPE_SELL)
+      return;
+
+   if(entry == DEAL_ENTRY_IN && reason != DEAL_REASON_SL && reason != DEAL_REASON_TP)
+   {
+      Log("新订单成交：dealTicket=" + IntegerToString(trans.deal) + 
+          ", type=" + EnumToString(trans.deal_type));
+      int totalPositions = PositionsTotal();
+      
+      // 获取新订单的止损价
+      double slPrice = HistoryDealGetDouble(trans.deal, DEAL_SL);
+      if(slPrice <= 0)
+      {
+         Log("警告：无法获取新订单止损价，dealTicket=" + IntegerToString(trans.deal));
+         UpdateStopLossesOnNewOrder(trans, totalPositions);
+         positionsChanged = true;
+         return;
+      }
+
+      // 检查并删除止损价对应的挂单
+      if(!OrderExists(slPrice))
+      {
+         UpdateStopLossesOnNewOrder(trans, totalPositions);
+         positionsChanged = true;
+         return;
+      }
+
+      for(int i = OrdersTotal() - 1; i >= 0; i--)
+      {
+         ulong ticket = OrderGetTicket(i);
+         if(!OrderSelect(ticket))
+         {
+            Log("警告：无法选择订单以删除，票号=" + IntegerToString(ticket));
+            continue;
+         }
+         if(OrderGetString(ORDER_SYMBOL) != _Symbol || OrderGetInteger(ORDER_MAGIC) != MAGIC_NUMBER)
+            continue;
+
+         double orderPrice = OrderGetDouble(ORDER_PRICE_OPEN);
+         if(NormalizeDouble(orderPrice, precisionDigits) != NormalizeDouble(slPrice, precisionDigits))
+            continue;
+
+         trade.OrderDelete(ticket);
+         Log("删除止损位置挂单：票号=" + IntegerToString(ticket) + 
+             ", 价格=" + DoubleToString(orderPrice, precisionDigits));
+      }
+
+      UpdateStopLossesOnNewOrder(trans, totalPositions);
+      positionsChanged = true;
+   }
+   else if(entry == DEAL_ENTRY_OUT && (reason == DEAL_REASON_SL || reason == DEAL_REASON_TP))
+   {
+      Log("止损/止盈触发：dealTicket=" + IntegerToString(trans.deal) + 
+          ", reason=" + EnumToString(reason));
+      stopEventDetected = true;
+      int totalPositions = PositionsTotal();
+      UpdateStopLossesOnStopTriggered(trans, totalPositions);
+      stopEventDetected = false;
+      positionsChanged = true;
+   }
+
+   if(positionsChanged || ordersChanged)
+   {
+      Log("检测到持仓或订单变化，更新缓存");
+      CachePositionGridPrices();
+      positionsChanged = false;
+      ordersChanged = false;
+   }
 }
 
 //+------------------------------------------------------------------+
-//| 缓存持仓信息                                                     |
+//| 按 OnTick 调用顺序排列的其他方法                                 |
 //+------------------------------------------------------------------+
+
+// 缓存持仓信息 (OnTick -> isFirstTick)
 void CachePositionGridPrices()
 {
    int totalPositions = PositionsTotal();
@@ -192,742 +427,7 @@ void CachePositionGridPrices()
    UpdateGridOccupancyMap();
 }
 
-//+------------------------------------------------------------------+
-//| 检查价格是否在止损/止盈列表中                                    |
-//+------------------------------------------------------------------+
-bool IsPriceInStopLossList(double price)
-{
-   double normalizedPrice = NormalizeDouble(price, precisionDigits);
-   for(int i = 0; i < ArraySize(positionsInfo); i++)
-   {
-      if(normalizedPrice == NormalizeDouble(positionsInfo[i].stopLossPrice, precisionDigits))
-         return true;
-   }
-   return false;
-}
-
-//+------------------------------------------------------------------+
-//| 初始化函数                                                       |
-//+------------------------------------------------------------------+
-int OnInit()
-{
-   if(!AccountInfoInteger(ACCOUNT_TRADE_ALLOWED))
-   {
-      Log("初始化失败：账户不允许交易");
-      return(INIT_FAILED);
-   }
-
-   if(SymbolInfoInteger(_Symbol, SYMBOL_TRADE_MODE) == SYMBOL_TRADE_MODE_DISABLED)
-   {
-      Log("初始化失败：市场未开放");
-      return(INIT_FAILED);
-   }
-
-   long chartId = ChartID();
-   string timeframe = EnumToString(_Period);
-   EXIT_SIGNAL = "Mayfly_" + _Symbol + "_" + timeframe + "_Exit_" + IntegerToString(chartId);
-   CLEANUP_DONE = "Mayfly_" + _Symbol + "_" + timeframe + "_CleanupDone_" + IntegerToString(chartId);
-
-   CleanupOrders();
-   GlobalVariableSet(EXIT_SIGNAL, 0);
-   if(GlobalVariableCheck(CLEANUP_DONE)) GlobalVariableDel(CLEANUP_DONE);
-
-   cachedSymbolPoint = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   precisionDigits = (int)MathCeil(-MathLog10(cachedSymbolPoint)) - 1;
-   cachedBidPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   cachedContractSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_CONTRACT_SIZE);
-   cachedTickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-   cachedTickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-   cachedMinLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-   cachedMaxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
-   cachedLotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-
-   grid.basePrice = (InputBasePrice == 0) ? 
-                    NormalizeDouble(MathFloor(cachedBidPrice * MathPow(10, precisionDigits + 1)) / MathPow(10, precisionDigits + 1), precisionDigits) : 
-                    NormalizeDouble(InputBasePrice, precisionDigits);
-
-   grid.GridStep = (GridSpacing > 0) ? NormalizeDouble(GridSpacing * cachedSymbolPoint, precisionDigits) : 
-                   NormalizeDouble((atrValue = GetATRValue(_Symbol, _Period, ATR_Period)) > 0 ? atrValue * 2.0 : 0.01, precisionDigits);
-   grid.originalGridStep = grid.GridStep;
-
-   if(GridLevels <= 0)
-   {
-      Log("初始化失败：GridLevels 必须大于 0，当前值=" + IntegerToString(GridLevels));
-      return(INIT_PARAMETERS_INCORRECT);
-   }
-
-   if(ArrayResize(grid.upperGrid, GridLevels) < 0 || ArrayResize(grid.lowerGrid, GridLevels) < 0)
-   {
-      Log("初始化失败：网格数组调整大小失败");
-      return(INIT_PARAMETERS_INCORRECT);
-   }
-
-   UpdateGridLevels();
-   trade.SetExpertMagicNumber(MAGIC_NUMBER);
-   SetupGridOrders();
-   DrawBasePriceLine();
-   lastDealTicket = GetLastDealTicket();
-   lastBidPrice = cachedBidPrice;
-   lastGridUpdateTime = TimeCurrent();
-   return(INIT_SUCCEEDED);
-}
-
-//+------------------------------------------------------------------+
-//| 反初始化函数                                                     |
-//+------------------------------------------------------------------+
-void OnDeinit(const int reason)
-{
-   if(!GlobalVariableCheck(CLEANUP_DONE) || GlobalVariableGet(CLEANUP_DONE) != 1)
-   {
-      Log("执行清理：未检测到清理完成标志或值为 0");
-      CleanupOrders();
-   }
-   ObjectDelete(0, "BasePriceLine");
-   Log("Mayfly 4.0.7 停止运行，原因代码=" + IntegerToString(reason));
-}
-
-//+------------------------------------------------------------------+
-//| Tick 函数                                                        |
-//+------------------------------------------------------------------+
-void OnTick()
-{
-   cachedBidPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-
-   if(isFirstTick)
-   {
-      CachePositionGridPrices();
-      isFirstTick = false;
-      lastProcessedBidPrice = cachedBidPrice;
-   }
-
-   datetime currentTime = TimeCurrent();
-   MqlDateTime timeStruct;
-   TimeToStruct(currentTime, timeStruct);
-   int currentHour = timeStruct.hour;
-
-   if(currentHour >= EndHour && !hasCleanedUpAfterEnd)
-   {
-      Log("超出交易时间范围，执行清理并退出");
-      CloseAllPositions();
-      CleanupOrders();
-      hasCleanedUpAfterEnd = true;
-      return;
-   }
-
-   if(currentHour < StartHour || currentHour >= EndHour)
-   {
-      Log("跳过 Tick 处理：当前时间 " + IntegerToString(currentHour) + 
-          " 不在交易时间范围 [" + IntegerToString(StartHour) + "-" + IntegerToString(EndHour) + "] 内");
-      return;
-   }
-   hasCleanedUpAfterEnd = false;
-
-   int currentPositions = PositionsTotal();
-   int currentOrders = OrdersTotal();
-   static int lastPositions = 0;
-   static int lastOrders = 0;
-   positionsChanged = (currentPositions != lastPositions);
-   ordersChanged = (currentOrders != lastOrders);
-   lastPositions = currentPositions;
-   lastOrders = currentOrders;
-
-   if(MathAbs(cachedBidPrice - lastProcessedBidPrice) < grid.GridStep && 
-      !positionsChanged && !ordersChanged)
-   {
-      Log("跳过 Tick 处理：价格变化未达 GridStep=" + DoubleToString(grid.GridStep, precisionDigits) + 
-          " 且无持仓/订单变化");
-      return;
-   }
-
-   if(positionsChanged || ordersChanged)
-   {
-      Log("检测到持仓或订单变化，更新缓存");
-      CachePositionGridPrices();
-   }
-
-   HandleGridAdjustment();
-   lastProcessedBidPrice = cachedBidPrice;
-
-   if(currentTime - lastGridUpdateTime >= 60)
-   {
-      Log("每分钟检查动态网格更新");
-      UpdateDynamicGrid(currentHour);
-   }
-
-   if(!HistorySelect(TimeCurrent() - 3600, TimeCurrent()))
-   {
-      Log("警告：无法选择历史记录，跳过订单处理");
-      return;
-   }
-
-   int totalDeals = HistoryDealsTotal();
-   if(totalDeals <= 0)
-   {
-      Log("跳过订单处理：无历史成交记录");
-      return;
-   }
-
-   ulong latestDealTicket = HistoryDealGetTicket(totalDeals - 1);
-   if(latestDealTicket <= lastDealTicket)
-   {
-      Log("跳过订单处理：最新成交票号 " + IntegerToString(latestDealTicket) + 
-          " 未超过 lastDealTicket=" + IntegerToString(lastDealTicket));
-      return;
-   }
-
-   if(HistoryDealGetInteger(latestDealTicket, DEAL_MAGIC) != MAGIC_NUMBER || 
-      HistoryDealGetString(latestDealTicket, DEAL_SYMBOL) != _Symbol)
-   {
-      Log("跳过订单处理：魔术号或品种不匹配，dealTicket=" + IntegerToString(latestDealTicket));
-      return;
-   }
-
-   ENUM_DEAL_REASON reason = (ENUM_DEAL_REASON)HistoryDealGetInteger(latestDealTicket, DEAL_REASON);
-   if(reason == DEAL_REASON_SL || reason == DEAL_REASON_TP)
-   {
-      UpdateStopLossesOnStopTriggered(latestDealTicket, currentPositions);
-   }
-   if(HistoryDealGetInteger(latestDealTicket, DEAL_ENTRY) == DEAL_ENTRY_IN)
-   {
-      UpdateStopLossesOnNewOrder(latestDealTicket, currentPositions);
-   }
-}
-
-//+------------------------------------------------------------------+
-//| 处理网格调整                                                     |
-//+------------------------------------------------------------------+
-void HandleGridAdjustment()
-{
-   int shift = 0;
-   if(cachedBidPrice >= grid.basePrice + grid.GridStep)
-      shift = (int)MathFloor((cachedBidPrice - grid.basePrice) / grid.GridStep);
-   else if(cachedBidPrice <= grid.basePrice - grid.GridStep)
-      shift = (int)MathCeil((cachedBidPrice - grid.basePrice) / grid.GridStep);
-
-   if(shift == 0 && (!stopEventDetected || lastStopLossPrice == 0))
-   {
-      Log("跳过网格调整：shift=0 且无止损事件或 lastStopLossPrice 未设置");
-      return;
-   }
-
-   if(shift != 0)
-   {
-      grid.basePrice = NormalizeDouble(grid.basePrice + shift * grid.GridStep, precisionDigits);
-      UpdateGridLevels();
-      Log("常规网格移动：shift=" + IntegerToString(shift) + ", 新 basePrice=" + DoubleToString(grid.basePrice, precisionDigits));
-   }
-   else if(stopEventDetected && lastStopLossPrice != 0)
-   {
-      double nearestGridPrice = grid.basePrice + MathRound((lastStopLossPrice - grid.basePrice) / grid.GridStep) * grid.GridStep;
-      if(MathAbs(lastStopLossPrice - nearestGridPrice) > SlippageTolerance * grid.GridStep)
-      {
-         Log("跳过止损后网格调整：lastStopLossPrice=" + DoubleToString(lastStopLossPrice, precisionDigits) + 
-             " 与 nearestGridPrice=" + DoubleToString(nearestGridPrice, precisionDigits) + " 差异超出容忍范围");
-         return;
-      }
-      grid.basePrice = nearestGridPrice;
-      UpdateGridLevels();
-      Log("止损后强制调整：新 basePrice=" + DoubleToString(grid.basePrice, precisionDigits));
-   }
-
-   AdjustGridOrders();
-   DrawBasePriceLine();
-}
-
-//+------------------------------------------------------------------+
-//| 更新网格层级                                                     |
-//+------------------------------------------------------------------+
-void UpdateGridLevels()
-{
-   for(int i = 0; i < GridLevels; i++)
-   {
-      grid.upperGrid[i] = NormalizeDouble(grid.basePrice + (i + 1) * grid.GridStep, precisionDigits);
-      grid.lowerGrid[i] = NormalizeDouble(grid.basePrice - (i + 1) * grid.GridStep, precisionDigits);
-   }
-   grid.upperBound = grid.upperGrid[GridLevels - 1];
-   grid.lowerBound = grid.lowerGrid[GridLevels - 1];
-}
-
-//+------------------------------------------------------------------+
-//| 更新动态网格（默认实现为空，高级功能在 .mqh 文件中）             |
-//+------------------------------------------------------------------+
-void UpdateDynamicGrid(int currentHour)
-{
-   // 默认实现为空，动态网格功能移至 Mayfly_Advanced_4_0_7.mqh
-   Log("跳过动态网格更新：默认实现不支持动态网格");
-}
-
-//+------------------------------------------------------------------+
-//| 挂单逻辑                                                         |
-//+------------------------------------------------------------------+
-void PlaceGridOrders(int totalPositions)
-{
-   if(totalPositions >= GridLevels)
-   {
-      Log("跳过挂单：持仓数量 " + IntegerToString(totalPositions) + " 已达 GridLevels=" + IntegerToString(GridLevels));
-      return;
-   }
-
-   if(totalPositions >= AddPositionTimes)
-   {
-      Log("跳过挂单：持仓数量 " + IntegerToString(totalPositions) + " 已达 AddPositionTimes=" + IntegerToString(AddPositionTimes));
-      return;
-   }
-
-   double totalLots = CalculateTotalLots();
-   if(totalLots >= MaxTotalLots)
-   {
-      Log("跳过挂单：总手数 " + DoubleToString(totalLots, 2) + " 已达 MaxTotalLots=" + DoubleToString(MaxTotalLots, 2));
-      return;
-   }
-
-   bool allowBuy = !stopEventDetected || lastStopLossType != POSITION_TYPE_SELL;
-   bool allowSell = !stopEventDetected || lastStopLossType != POSITION_TYPE_BUY;
-   int addCount = 0;
-
-   for(int i = 0; i < GridLevels && addCount < AddPositionTimes && totalLots < MaxTotalLots; i++)
-   {
-      double buyPrice = grid.upperGrid[i];
-      double sellPrice = grid.lowerGrid[i];
-      double lotSizeBuy = CalculateLotSize(grid.GridStep, buyPrice);
-      double lotSizeSell = CalculateLotSize(grid.GridStep, sellPrice);
-      double currentBuyLotSize = AdjustLotSizeByMode(lotSizeBuy, addCount, totalLots);
-      double currentSellLotSize = AdjustLotSizeByMode(lotSizeSell, addCount, totalLots);
-
-      if(EnableMirror)
-      {
-         if(currentSellLotSize > 0 && allowBuy && !OrderExists(buyPrice) && !PositionExists(buyPrice) && 
-            !IsPriceInStopLossList(buyPrice) && !IsPriceAtStopLoss(buyPrice))
-         {
-            trade.BuyLimit(currentSellLotSize, buyPrice, _Symbol, 0, buyPrice + grid.GridStep, ORDER_TIME_GTC, 0, "Buy Limit Grid");
-            totalLots += currentSellLotSize;
-            addCount++;
-            Log("挂单：Buy Limit @ " + DoubleToString(buyPrice, precisionDigits) + 
-                ", 手数=" + DoubleToString(currentSellLotSize, 2));
-         }
-         if(currentBuyLotSize > 0 && allowSell && !OrderExists(sellPrice) && !PositionExists(sellPrice) && 
-            !IsPriceInStopLossList(sellPrice) && !IsPriceAtStopLoss(sellPrice))
-         {
-            trade.SellLimit(currentBuyLotSize, sellPrice, _Symbol, 0, sellPrice - grid.GridStep, ORDER_TIME_GTC, 0, "Sell Limit Grid");
-            totalLots += currentBuyLotSize;
-            addCount++;
-            Log("挂单：Sell Limit @ " + DoubleToString(sellPrice, precisionDigits) + 
-                ", 手数=" + DoubleToString(currentBuyLotSize, 2));
-         }
-      }
-      else
-      {
-         if(currentBuyLotSize > 0 && allowBuy && !OrderExists(buyPrice) && !PositionExists(buyPrice) && 
-            !IsPriceInStopLossList(buyPrice) && !IsPriceAtStopLoss(buyPrice))
-         {
-            trade.BuyStop(currentBuyLotSize, buyPrice, _Symbol, buyPrice - grid.GridStep, 0, ORDER_TIME_GTC, 0, "Buy Stop Grid");
-            totalLots += currentBuyLotSize;
-            addCount++;
-            Log("挂单：Buy Stop @ " + DoubleToString(buyPrice, precisionDigits) + 
-                ", 手数=" + DoubleToString(currentBuyLotSize, 2));
-         }
-         if(currentSellLotSize > 0 && allowSell && !OrderExists(sellPrice) && !PositionExists(sellPrice) && 
-            !IsPriceInStopLossList(sellPrice) && !IsPriceAtStopLoss(sellPrice))
-         {
-            trade.SellStop(currentSellLotSize, sellPrice, _Symbol, sellPrice + grid.GridStep, 0, ORDER_TIME_GTC, 0, "Sell Stop Grid");
-            totalLots += currentSellLotSize;
-            addCount++;
-            Log("挂单：Sell Stop @ " + DoubleToString(sellPrice, precisionDigits) + 
-                ", 手数=" + DoubleToString(currentSellLotSize, 2));
-         }
-      }
-   }
-}
-
-//+------------------------------------------------------------------+
-//| 平仓所有持仓                                                     |
-//+------------------------------------------------------------------+
-void CloseAllPositions()
-{
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-   {
-      ulong ticket = PositionGetTicket(i);
-      if(!PositionSelectByTicket(ticket))
-      {
-         Log("警告：无法选择持仓以平仓，票号=" + IntegerToString(ticket));
-         continue;
-      }
-
-      if(PositionGetString(POSITION_SYMBOL) != _Symbol || PositionGetInteger(POSITION_MAGIC) != MAGIC_NUMBER)
-      {
-         Log("跳过平仓：品种或魔术号不匹配，票号=" + IntegerToString(ticket));
-         continue;
-      }
-
-      trade.PositionClose(ticket);
-   }
-}
-
-//+------------------------------------------------------------------+
-//| 清理所有挂单                                                     |
-//+------------------------------------------------------------------+
-void CleanupOrders()
-{
-   for(int i = OrdersTotal() - 1; i >= 0; i--)
-   {
-      ulong ticket = OrderGetTicket(i);
-      if(!OrderSelect(ticket))
-      {
-         Log("警告：无法选择订单以清理，票号=" + IntegerToString(ticket));
-         continue;
-      }
-
-      if(OrderGetString(ORDER_SYMBOL) != _Symbol || OrderGetInteger(ORDER_MAGIC) != MAGIC_NUMBER)
-      {
-         Log("跳过订单清理：品种或魔术号不匹配，票号=" + IntegerToString(ticket));
-         continue;
-      }
-
-      trade.OrderDelete(ticket);
-   }
-   GlobalVariableSet(CLEANUP_DONE, 1);
-   GlobalVariableSet(EXIT_SIGNAL, 0);
-   Log("清理完成！");
-}
-
-//+------------------------------------------------------------------+
-//| 绘制基准价格线                                                   |
-//+------------------------------------------------------------------+
-void DrawBasePriceLine()
-{
-   ObjectDelete(0, "BasePriceLine");
-   ObjectCreate(0, "BasePriceLine", OBJ_HLINE, 0, 0, grid.basePrice);
-   ObjectSetInteger(0, "BasePriceLine", OBJPROP_COLOR, clrRed);
-   ObjectSetInteger(0, "BasePriceLine", OBJPROP_STYLE, STYLE_SOLID);
-   ObjectSetInteger(0, "BasePriceLine", OBJPROP_WIDTH, 1);
-}
-
-//+------------------------------------------------------------------+
-//| 获取最新成交票号                                                 |
-//+------------------------------------------------------------------+
-ulong GetLastDealTicket()
-{
-   if(!HistorySelect(TimeCurrent() - 3600, TimeCurrent()))
-   {
-      Log("警告：无法选择历史记录，返回上次的 lastDealTicket=" + IntegerToString(lastDealTicket));
-      return lastDealTicket;
-   }
-
-   int totalDeals = HistoryDealsTotal();
-   for(int i = totalDeals - 1; i >= 0; i--)
-   {
-      ulong dealTicket = HistoryDealGetTicket(i);
-      if(dealTicket <= 0 || HistoryDealGetString(dealTicket, DEAL_SYMBOL) != _Symbol || 
-         HistoryDealGetInteger(dealTicket, DEAL_MAGIC) != MAGIC_NUMBER || 
-         HistoryDealGetInteger(dealTicket, DEAL_ENTRY) != DEAL_ENTRY_IN)
-      {
-         continue;
-      }
-      return dealTicket;
-   }
-   Log("未找到符合条件的最新成交，返回 lastDealTicket=" + IntegerToString(lastDealTicket));
-   return lastDealTicket;
-}
-
-//+------------------------------------------------------------------+
-//| 设置初始网格订单                                                 |
-//+------------------------------------------------------------------+
-void SetupGridOrders()
-{
-   PlaceGridOrders(PositionsTotal());
-}
-
-//+------------------------------------------------------------------+
-//| 调整网格订单                                                     |
-//+------------------------------------------------------------------+
-void AdjustGridOrders()
-{
-   for(int i = OrdersTotal() - 1; i >= 0; i--)
-   {
-      ulong ticket = OrderGetTicket(i);
-      if(!OrderSelect(ticket))
-      {
-         Log("警告：无法选择订单以调整，票号=" + IntegerToString(ticket));
-         continue;
-      }
-
-      if(OrderGetString(ORDER_SYMBOL) != _Symbol || OrderGetInteger(ORDER_MAGIC) != MAGIC_NUMBER)
-      {
-         Log("跳过订单调整：品种或魔术号不匹配，票号=" + IntegerToString(ticket));
-         continue;
-      }
-
-      double orderPrice = OrderGetDouble(ORDER_PRICE_OPEN);
-      if(orderPrice > grid.upperBound || orderPrice < grid.lowerBound)
-      {
-         trade.OrderDelete(ticket);
-         Log("删除订单：价格 " + DoubleToString(orderPrice, precisionDigits) + 
-             " 超出网格范围 [" + DoubleToString(grid.lowerBound, precisionDigits) + ", " + 
-             DoubleToString(grid.upperBound, precisionDigits) + "]");
-      }
-   }
-   PlaceGridOrders(PositionsTotal());
-}
-
-//+------------------------------------------------------------------+
-//| 当止损/止盈触发时更新止损                                        |
-//+------------------------------------------------------------------+
-void UpdateStopLossesOnStopTriggered(ulong dealTicket, int totalPositions)
-{
-   stopEventDetected = true;
-   lastStopLossPrice = HistoryDealGetDouble(dealTicket, DEAL_PRICE);
-   lastStopLossType = (HistoryDealGetInteger(dealTicket, DEAL_TYPE) == DEAL_TYPE_BUY) ? 
-                      POSITION_TYPE_BUY : POSITION_TYPE_SELL;
-   lastDealTicket = dealTicket;
-
-   CheckAbnormalStopLoss();
-   PlaceGridOrders(totalPositions);
-
-   Log("止损/止盈触发处理完成：dealTicket=" + IntegerToString(dealTicket) + 
-       ", symbol=" + _Symbol + ", price=" + DoubleToString(lastStopLossPrice, precisionDigits) + 
-       ", type=" + EnumToString(lastStopLossType));
-
-   if(EnableMirror)
-   {
-      double newBuyStopLoss = 0;
-      double newSellStopLoss = 0;
-      datetime latestTime = 0;
-
-      for(int i = totalPositions - 1; i >= 0; i--)
-      {
-         ulong ticket = PositionGetTicket(i);
-         if(!PositionSelectByTicket(ticket))
-         {
-            Log("警告：无法选择持仓以更新止盈，票号=" + IntegerToString(ticket));
-            continue;
-         }
-
-         if(PositionGetString(POSITION_SYMBOL) != _Symbol || PositionGetInteger(POSITION_MAGIC) != MAGIC_NUMBER)
-         {
-            Log("跳过止盈更新：品种或魔术号不匹配，票号=" + IntegerToString(ticket));
-            continue;
-         }
-
-         datetime openTime = (datetime)PositionGetInteger(POSITION_TIME);
-         if(openTime <= latestTime)
-         {
-            continue;
-         }
-
-         latestTime = openTime;
-         double price = PositionGetDouble(POSITION_TP);
-         if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
-            newBuyStopLoss = price;
-         else
-            newSellStopLoss = price;
-         lastStopLossPrice = price;
-      }
-
-      if(newBuyStopLoss <= 0 && newSellStopLoss <= 0)
-      {
-         Log("跳过止盈更新：未检测到新的止盈价格");
-         return;
-      }
-
-      if(newBuyStopLoss == lastBuyStopLoss && newSellStopLoss == lastSellStopLoss)
-      {
-         Log("跳过止盈更新：新止盈价格未变化，newBuyStopLoss=" + DoubleToString(newBuyStopLoss, precisionDigits) + 
-             ", newSellStopLoss=" + DoubleToString(newSellStopLoss, precisionDigits));
-         return;
-      }
-
-      for(int i = totalPositions - 1; i >= 0; i--)
-      {
-         ulong ticket = PositionGetTicket(i);
-         if(!PositionSelectByTicket(ticket))
-         {
-            Log("警告：无法选择持仓以修改止盈，票号=" + IntegerToString(ticket));
-            continue;
-         }
-
-         if(PositionGetString(POSITION_SYMBOL) != _Symbol || PositionGetInteger(POSITION_MAGIC) != MAGIC_NUMBER)
-         {
-            Log("跳过止盈修改：品种或魔术号不匹配，票号=" + IntegerToString(ticket));
-            continue;
-         }
-
-         if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY && newBuyStopLoss > 0)
-            trade.PositionModify(ticket, 0, NormalizeDouble(newBuyStopLoss, precisionDigits));
-         else if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL && newSellStopLoss > 0)
-            trade.PositionModify(ticket, 0, NormalizeDouble(newSellStopLoss, precisionDigits));
-      }
-      lastBuyStopLoss = newBuyStopLoss;
-      lastSellStopLoss = newSellStopLoss;
-      Log("止盈更新完成（镜像模式）：lastBuyStopLoss=" + DoubleToString(lastBuyStopLoss, precisionDigits) + 
-          ", lastSellStopLoss=" + DoubleToString(lastSellStopLoss, precisionDigits));
-   }
-}
-
-//+------------------------------------------------------------------+
-//| 当新订单成交时更新止损                                           |
-//+------------------------------------------------------------------+
-void UpdateStopLossesOnNewOrder(ulong dealTicket, int totalPositions)
-{
-   lastDealTicket = dealTicket;
-
-   if(!EnableMirror)
-   {
-      ulong latestPositionTicket = 0;
-      for(int i = totalPositions - 1; i >= 0; i--)
-      {
-         ulong ticket = PositionGetTicket(i);
-         if(!PositionSelectByTicket(ticket))
-         {
-            Log("警告：无法选择持仓以查找最新成交，票号=" + IntegerToString(ticket));
-            continue;
-         }
-
-         if(PositionGetString(POSITION_SYMBOL) != _Symbol || PositionGetInteger(POSITION_MAGIC) != MAGIC_NUMBER)
-         {
-            Log("跳过持仓检查：品种或魔术号不匹配，票号=" + IntegerToString(ticket));
-            continue;
-         }
-
-         if(PositionGetInteger(POSITION_TICKET) == dealTicket)
-         {
-            latestPositionTicket = ticket;
-            break;
-         }
-      }
-
-      if(latestPositionTicket == 0)
-      {
-         Log("跳过止损更新：未找到最新成交对应的持仓，dealTicket=" + IntegerToString(dealTicket));
-         return;
-      }
-
-      if(!PositionSelectByTicket(latestPositionTicket))
-      {
-         Log("错误：无法选择最新持仓以获取止损，票号=" + IntegerToString(latestPositionTicket));
-         return;
-      }
-
-      double newStopLoss = PositionGetDouble(POSITION_SL);
-      if(newStopLoss <= 0)
-      {
-         Log("跳过止损更新：最新持仓止损无效，newStopLoss=" + DoubleToString(newStopLoss, precisionDigits));
-         return;
-      }
-
-      for(int i = totalPositions - 1; i >= 0; i--)
-      {
-         ulong ticket = PositionGetTicket(i);
-         if(!PositionSelectByTicket(ticket))
-         {
-            Log("警告：无法选择持仓以修改止损，票号=" + IntegerToString(ticket));
-            continue;
-         }
-
-         if(PositionGetString(POSITION_SYMBOL) != _Symbol || PositionGetInteger(POSITION_MAGIC) != MAGIC_NUMBER)
-         {
-            Log("跳过止损修改：品种或魔术号不匹配，票号=" + IntegerToString(ticket));
-            continue;
-         }
-
-         double currentSL = PositionGetDouble(POSITION_SL);
-         if(MathAbs(currentSL - newStopLoss) < cachedSymbolPoint)
-         {
-            Log("跳过止损修改：当前止损与新止损差异过小，票号=" + IntegerToString(ticket));
-            continue;
-         }
-
-         trade.PositionModify(ticket, NormalizeDouble(newStopLoss, precisionDigits), 0);
-         Log("更新持仓止损：票号=" + IntegerToString(ticket) + ", 新止损=" + DoubleToString(newStopLoss, precisionDigits));
-      }
-
-      if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
-         lastBuyStopLoss = newStopLoss;
-      else
-         lastSellStopLoss = newStopLoss;
-   }
-   else
-   {
-      double newBuyStopLoss = 0;
-      double newSellStopLoss = 0;
-      datetime latestTime = 0;
-
-      for(int i = totalPositions - 1; i >= 0; i--)
-      {
-         ulong ticket = PositionGetTicket(i);
-         if(!PositionSelectByTicket(ticket))
-         {
-            Log("警告：无法选择持仓以更新止盈，票号=" + IntegerToString(ticket));
-            continue;
-         }
-
-         if(PositionGetString(POSITION_SYMBOL) != _Symbol || PositionGetInteger(POSITION_MAGIC) != MAGIC_NUMBER)
-         {
-            Log("跳过止盈更新：品种或魔术号不匹配，票号=" + IntegerToString(ticket));
-            continue;
-         }
-
-         datetime openTime = (datetime)PositionGetInteger(POSITION_TIME);
-         if(openTime <= latestTime)
-         {
-            continue;
-         }
-
-         latestTime = openTime;
-         double price = PositionGetDouble(POSITION_TP);
-         if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
-            newBuyStopLoss = price;
-         else
-            newSellStopLoss = price;
-         lastStopLossPrice = price;
-      }
-
-      if(newBuyStopLoss <= 0 && newSellStopLoss <= 0)
-      {
-         Log("跳过止盈更新：未检测到新的止盈价格");
-         return;
-      }
-
-      if(newBuyStopLoss == lastBuyStopLoss && newSellStopLoss == lastSellStopLoss)
-      {
-         Log("跳过止盈更新：新止盈价格未变化，newBuyStopLoss=" + DoubleToString(newBuyStopLoss, precisionDigits) + 
-             ", newSellStopLoss=" + DoubleToString(newSellStopLoss, precisionDigits));
-         return;
-      }
-
-      for(int i = totalPositions - 1; i >= 0; i--)
-      {
-         ulong ticket = PositionGetTicket(i);
-         if(!PositionSelectByTicket(ticket))
-         {
-            Log("警告：无法选择持仓以修改止盈，票号=" + IntegerToString(ticket));
-            continue;
-         }
-
-         if(PositionGetString(POSITION_SYMBOL) != _Symbol || PositionGetInteger(POSITION_MAGIC) != MAGIC_NUMBER)
-         {
-            Log("跳过止盈修改：品种或魔术号不匹配，票号=" + IntegerToString(ticket));
-            continue;
-         }
-
-         if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY && newBuyStopLoss > 0)
-            trade.PositionModify(ticket, 0, NormalizeDouble(newBuyStopLoss, precisionDigits));
-         else if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL && newSellStopLoss > 0)
-            trade.PositionModify(ticket, 0, NormalizeDouble(newSellStopLoss, precisionDigits));
-      }
-      lastBuyStopLoss = newBuyStopLoss;
-      lastSellStopLoss = newSellStopLoss;
-      Log("止盈更新完成（镜像模式）：lastBuyStopLoss=" + DoubleToString(lastBuyStopLoss, precisionDigits) + 
-          ", lastSellStopLoss=" + DoubleToString(lastSellStopLoss, precisionDigits));
-   }
-
-   CheckAbnormalStopLoss();
-   PlaceGridOrders(totalPositions);
-   Log("新订单成交处理完成：dealTicket=" + IntegerToString(dealTicket));
-}
-
-//+------------------------------------------------------------------+
-//| 更新网格占用映射                                                 |
-//+------------------------------------------------------------------+
+// 更新网格占用映射 (CachePositionGridPrices 调用)
 void UpdateGridOccupancyMap()
 {
    ArrayResize(gridOccupancyMap, GridLevels * 2);
@@ -982,9 +482,7 @@ void UpdateGridOccupancyMap()
    }
 }
 
-//+------------------------------------------------------------------+
-//| 获取网格索引                                                     |
-//+------------------------------------------------------------------+
+// 获取网格索引 (UpdateGridOccupancyMap 调用)
 int GetGridIndex(double price)
 {
    double shift = MathRound((price - grid.basePrice) / grid.GridStep);
@@ -993,34 +491,212 @@ int GetGridIndex(double price)
    return -1;
 }
 
-//+------------------------------------------------------------------+
-//| 检查挂单或持仓                                                   |
-//+------------------------------------------------------------------+
-bool OrderExists(double price)
+// 平仓所有持仓 (OnTick -> 超出交易时间)
+void CloseAllPositions()
 {
-   int index = GetGridIndex(price);
-   if(index < 0 || index >= ArraySize(gridOccupancyMap))
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
-      Log("跳过挂单检查：价格 " + DoubleToString(price, precisionDigits) + " 超出网格范围");
-      return false;
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket))
+      {
+         Log("警告：无法选择持仓以平仓，票号=" + IntegerToString(ticket));
+         continue;
+      }
+
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol || PositionGetInteger(POSITION_MAGIC) != MAGIC_NUMBER)
+      {
+         Log("跳过平仓：品种或魔术号不匹配，票号=" + IntegerToString(ticket));
+         continue;
+      }
+
+      trade.PositionClose(ticket);
    }
-   return gridOccupancyMap[index] == 1;
 }
 
-bool PositionExists(double price)
+// 清理所有挂单 (OnTick -> 超出交易时间)
+void CleanupOrders()
 {
-   int index = GetGridIndex(price);
-   if(index < 0 || index >= ArraySize(gridOccupancyMap))
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
    {
-      Log("跳过持仓检查：价格 " + DoubleToString(price, precisionDigits) + " 超出网格范围");
-      return false;
+      ulong ticket = OrderGetTicket(i);
+      if(!OrderSelect(ticket))
+      {
+         Log("警告：无法选择订单以清理，票号=" + IntegerToString(ticket));
+         continue;
+      }
+
+      if(OrderGetString(ORDER_SYMBOL) != _Symbol || OrderGetInteger(ORDER_MAGIC) != MAGIC_NUMBER)
+      {
+         Log("跳过订单清理：品种或魔术号不匹配，票号=" + IntegerToString(ticket));
+         continue;
+      }
+
+      trade.OrderDelete(ticket);
    }
-   return gridOccupancyMap[index] == 2;
+   GlobalVariableSet(CLEANUP_DONE, 1);
+   GlobalVariableSet(EXIT_SIGNAL, 0);
+   Log("清理完成！");
 }
 
-//+------------------------------------------------------------------+
-//| 计算总手数                                                       |
-//+------------------------------------------------------------------+
+// 处理网格调整 (OnTick 调用)
+void HandleGridAdjustment()
+{
+   if(!stopEventDetected && MathAbs(cachedBidPrice - grid.basePrice) < grid.GridStep)
+      return;
+
+   int shift = 0;
+   if(cachedBidPrice >= grid.basePrice + grid.GridStep)
+      shift = (int)MathFloor((cachedBidPrice - grid.basePrice) / grid.GridStep);
+   else if(cachedBidPrice <= grid.basePrice - grid.GridStep)
+      shift = (int)MathCeil((cachedBidPrice - grid.basePrice) / grid.GridStep);
+
+   if(shift != 0)
+   {
+      grid.basePrice = NormalizeDouble(grid.basePrice + shift * grid.GridStep, precisionDigits);
+      UpdateGridLevels();
+   }
+   else if(stopEventDetected)
+   {
+      double nearestGridPrice = grid.basePrice + MathRound((lastOrderSLPrice - grid.basePrice) / grid.GridStep) * grid.GridStep;
+      if(MathAbs(lastOrderSLPrice - nearestGridPrice) > SlippageTolerance * grid.GridStep)
+      {
+         Log("跳过止损后网格调整：lastOrderSLPrice=" + DoubleToString(lastOrderSLPrice, precisionDigits) + 
+             " 与 nearestGridPrice=" + DoubleToString(nearestGridPrice, precisionDigits) + " 差异超出容忍范围");
+         return;
+      }
+      grid.basePrice = nearestGridPrice;
+      UpdateGridLevels();
+      Log("止损后强制调整：新 basePrice=" + DoubleToString(grid.basePrice, precisionDigits));
+   }
+
+   AdjustGridOrders();
+   DrawBasePriceLine();
+}
+
+// 更新网格层级 (HandleGridAdjustment 调用)
+void UpdateGridLevels()
+{
+   for(int i = 0; i < GridLevels; i++)
+   {
+      grid.upperGrid[i] = NormalizeDouble(grid.basePrice + (i + 1) * grid.GridStep, precisionDigits);
+      grid.lowerGrid[i] = NormalizeDouble(grid.basePrice - (i + 1) * grid.GridStep, precisionDigits);
+   }
+   grid.upperBound = grid.upperGrid[GridLevels - 1];
+   grid.lowerBound = grid.lowerGrid[GridLevels - 1];
+}
+
+// 调整网格订单 (HandleGridAdjustment 调用)
+void AdjustGridOrders()
+{
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(!OrderSelect(ticket))
+      {
+         Log("警告：无法选择订单以调整，票号=" + IntegerToString(ticket));
+         continue;
+      }
+
+      if(OrderGetString(ORDER_SYMBOL) != _Symbol || OrderGetInteger(ORDER_MAGIC) != MAGIC_NUMBER)
+      {
+         Log("跳过订单调整：品种或魔术号不匹配，票号=" + IntegerToString(ticket));
+         continue;
+      }
+
+      double orderPrice = OrderGetDouble(ORDER_PRICE_OPEN);
+      if(orderPrice > grid.upperBound || orderPrice < grid.lowerBound)
+      {
+         trade.OrderDelete(ticket);
+         Log("删除订单：价格 " + DoubleToString(orderPrice, precisionDigits) + 
+             " 超出网格范围 [" + DoubleToString(grid.lowerBound, precisionDigits) + ", " + 
+             DoubleToString(grid.upperBound, precisionDigits) + "]");
+      }
+   }
+   PlaceGridOrders(PositionsTotal());
+}
+
+// 挂单逻辑 (AdjustGridOrders 调用)
+void PlaceGridOrders(int totalPositions)
+{
+   UpdateGridOccupancyMap(); // 强制刷新占用映射
+   if(totalPositions >= GridLevels)
+   {
+      Log("跳过挂单：持仓数量 " + IntegerToString(totalPositions) + " 已达 GridLevels=" + IntegerToString(GridLevels));
+      return;
+   }
+
+   if(totalPositions >= AddPositionTimes)
+   {
+      Log("跳过挂单：持仓数量 " + IntegerToString(totalPositions) + " 已达 AddPositionTimes=" + IntegerToString(AddPositionTimes));
+      return;
+   }
+
+   double totalLots = CalculateTotalLots();
+   if(totalLots >= MaxTotalLots)
+   {
+      Log("跳过挂单：总手数 " + DoubleToString(totalLots, 2) + " 已达 MaxTotalLots=" + DoubleToString(MaxTotalLots, 2));
+      return;
+   }
+
+   bool allowBuy = !stopEventDetected || lastStopLossType != POSITION_TYPE_SELL;
+   bool allowSell = !stopEventDetected || lastStopLossType != POSITION_TYPE_BUY;
+   int addCount = 0;
+
+   for(int i = 0; i < GridLevels && addCount < AddPositionTimes && totalLots < MaxTotalLots; i++)
+   {
+      double buyPrice = grid.upperGrid[i];
+      double sellPrice = grid.lowerGrid[i];
+      double lotSizeBuy = CalculateLotSize(grid.GridStep, buyPrice);
+      double lotSizeSell = CalculateLotSize(grid.GridStep, sellPrice);
+      double currentBuyLotSize = AdjustLotSizeByMode(lotSizeBuy, addCount, totalLots);
+      double currentSellLotSize = AdjustLotSizeByMode(lotSizeSell, addCount, totalLots);
+
+      if(!EnableMirror)
+      {
+         // Buy Stop 逻辑
+         if(currentBuyLotSize > 0 && allowBuy && !OrderExists(buyPrice) && !PositionExists(buyPrice) && 
+            NormalizeDouble(buyPrice, precisionDigits) != NormalizeDouble(lastPositionSLPrice, precisionDigits))
+         {
+            trade.BuyStop(currentBuyLotSize, buyPrice, _Symbol, buyPrice - grid.GridStep, 0, ORDER_TIME_GTC, 0, "Buy Stop Grid");
+            totalLots += currentBuyLotSize;
+            addCount++;
+            Log("挂单：Buy Stop @ " + DoubleToString(buyPrice, precisionDigits) + 
+                ", 手数=" + DoubleToString(currentBuyLotSize, 2));
+         }
+         else
+         {
+            Log("跳过 Buy Stop @ " + DoubleToString(buyPrice, precisionDigits) + 
+                ": lotSize=" + DoubleToString(currentBuyLotSize, 2) + 
+                ", allowBuy=" + (allowBuy ? "true" : "false") + 
+                ", orderExists=" + (OrderExists(buyPrice) ? "true" : "false") + 
+                ", positionExists=" + (PositionExists(buyPrice) ? "true" : "false") + 
+                ", atPositionSLPrice=" + (NormalizeDouble(buyPrice, precisionDigits) == NormalizeDouble(lastPositionSLPrice, precisionDigits) ? "true" : "false"));
+         }
+
+         // Sell Stop 逻辑
+         if(currentSellLotSize > 0 && allowSell && !OrderExists(sellPrice) && !PositionExists(sellPrice) && 
+            NormalizeDouble(sellPrice, precisionDigits) != NormalizeDouble(lastPositionSLPrice, precisionDigits))
+         {
+            trade.SellStop(currentSellLotSize, sellPrice, _Symbol, sellPrice + grid.GridStep, 0, ORDER_TIME_GTC, 0, "Sell Stop Grid");
+            totalLots += currentSellLotSize;
+            addCount++;
+            Log("挂单：Sell Stop @ " + DoubleToString(sellPrice, precisionDigits) + 
+                ", 手数=" + DoubleToString(currentSellLotSize, 2));
+         }
+         else
+         {
+            Log("跳过 Sell Stop @ " + DoubleToString(sellPrice, precisionDigits) + 
+                ": lotSize=" + DoubleToString(currentSellLotSize, 2) + 
+                ", allowSell=" + (allowSell ? "true" : "false") + 
+                ", orderExists=" + (OrderExists(sellPrice) ? "true" : "false") + 
+                ", positionExists=" + (PositionExists(sellPrice) ? "true" : "false") + 
+                ", atPositionSLPrice=" + (NormalizeDouble(sellPrice, precisionDigits) == NormalizeDouble(lastPositionSLPrice, precisionDigits) ? "true" : "false"));
+         }
+      }
+   }
+}
+
+// 计算总手数 (PlaceGridOrders 调用)
 double CalculateTotalLots()
 {
    double totalLots = 0.0;
@@ -1044,9 +720,16 @@ double CalculateTotalLots()
    return totalLots;
 }
 
-//+------------------------------------------------------------------+
-//| 根据加仓模式调整手数（仅均匀模式）                               |
-//+------------------------------------------------------------------+
+// 计算手数 (PlaceGridOrders 调用)
+double CalculateLotSize(double stopLossDistance, double price)
+{
+   if(TradeMode == TRADE_MODE_FIXED)
+      return NormalizeDouble(LotSize, 2);
+
+   return CalculateLotSizeAdvanced(stopLossDistance, price, TradeMode);
+}
+
+// 根据加仓模式调整手数 (PlaceGridOrders 调用)
 double AdjustLotSizeByMode(double baseLotSize, int addCount, double totalLots)
 {
    if(totalLots + baseLotSize > MaxTotalLots)
@@ -1056,20 +739,117 @@ double AdjustLotSizeByMode(double baseLotSize, int addCount, double totalLots)
       return 0;
    }
 
-   return baseLotSize; // 仅支持均匀加仓模式
+   if(AddPositionMode == ADD_MODE_UNIFORM)
+      return baseLotSize;
+
+   return AdjustLotSizeByModeAdvanced(baseLotSize, addCount, totalLots, AddPositionMode);
 }
 
-//+------------------------------------------------------------------+
-//| 计算手数（仅固定手数模式）                                       |
-//+------------------------------------------------------------------+
-double CalculateLotSize(double stopLossDistance, double price)
+// 检查挂单或持仓 (PlaceGridOrders 调用)
+bool OrderExists(double price)
 {
-   return NormalizeDouble(LotSize, 2); // 仅支持固定手数模式
+   int index = GetGridIndex(price);
+   if(index < 0 || index >= ArraySize(gridOccupancyMap))
+   {
+      Log("跳过挂单检查：价格 " + DoubleToString(price, precisionDigits) + " 超出网格范围");
+      return false;
+   }
+   return gridOccupancyMap[index] == 1;
+}
+
+bool PositionExists(double price)
+{
+   int index = GetGridIndex(price);
+   if(index < 0 || index >= ArraySize(gridOccupancyMap))
+   {
+      Log("跳过持仓检查：价格 " + DoubleToString(price, precisionDigits) + " 超出网格范围");
+      return false;
+   }
+   return gridOccupancyMap[index] == 2;
+}
+
+// 绘制基准价格线 (HandleGridAdjustment 调用)
+void DrawBasePriceLine()
+{
+   ObjectDelete(0, "BasePriceLine");
+   ObjectCreate(0, "BasePriceLine", OBJ_HLINE, 0, 0, grid.basePrice);
+   ObjectSetInteger(0, "BasePriceLine", OBJPROP_COLOR, clrRed);
+   ObjectSetInteger(0, "BasePriceLine", OBJPROP_STYLE, STYLE_SOLID);
+   ObjectSetInteger(0, "BasePriceLine", OBJPROP_WIDTH, 1);
+}
+
+// 检查异常止损情况 (OnTick 调用)
+void CheckAbnormalStopLoss()
+{
+   double priceDiff = (lastStopLossType == POSITION_TYPE_BUY) ? 
+                      (lastPositionSLPrice - cachedBidPrice) : (cachedBidPrice - lastPositionSLPrice);
+   if(priceDiff <= AbnormalStopLossMultiplier * grid.GridStep)
+   {
+      Log("跳过异常止损处理：价格差异 " + DoubleToString(priceDiff, precisionDigits) + 
+          " 未超过阈值 " + DoubleToString(AbnormalStopLossMultiplier * grid.GridStep, precisionDigits));
+      return;
+   }
+
+   Log("检测到异常止损情况！平掉全部订单！当前价格=" + DoubleToString(cachedBidPrice, precisionDigits) + 
+       ", 最新持仓止损价=" + DoubleToString(lastPositionSLPrice, precisionDigits) + 
+       ", 价格差异=" + DoubleToString(priceDiff, precisionDigits) + 
+       ", 阈值=" + DoubleToString(AbnormalStopLossMultiplier * grid.GridStep, precisionDigits));
+   CloseAllPositions();
+}
+
+// 更新动态网格 (OnTick 调用)
+void UpdateDynamicGrid(int currentHour)
+{
+   if(!EnableDynamicGrid)
+   {
+      Log("跳过动态网格更新：EnableDynamicGrid 未启用");
+      return;
+   }
+   UpdateDynamicGridAdvanced(currentHour);
 }
 
 //+------------------------------------------------------------------+
-//| 获取 ATR 值                                                      |
+//| 剩余方法 (按其他调用关系排列)                                   |
 //+------------------------------------------------------------------+
+
+// 自定义日志函数 (多处调用)
+void Log(string message)
+{
+   if(EnableLogging) Print(message);
+}
+
+// 设置初始网格订单 (OnInit 调用)
+void SetupGridOrders()
+{
+   PlaceGridOrders(PositionsTotal());
+}
+
+// 获取最新成交票号 (OnInit 调用)
+ulong GetLastDealTicket()
+{
+   if(!HistorySelect(TimeCurrent() - 3600, TimeCurrent()))
+   {
+      Log("警告：无法选择历史记录，返回上次的 lastDealTicket=" + IntegerToString(lastDealTicket));
+      return lastDealTicket;
+   }
+
+   int totalDeals = HistoryDealsTotal();
+   for(int i = totalDeals - 1; i >= 0; i--)
+   {
+      ulong dealTicket = HistoryDealGetTicket(i);
+      if(dealTicket <= 0 || HistoryDealGetString(dealTicket, DEAL_SYMBOL) != _Symbol || 
+         HistoryDealGetInteger(dealTicket, DEAL_MAGIC) != MAGIC_NUMBER || 
+         HistoryDealGetInteger(dealTicket, DEAL_ENTRY) != DEAL_ENTRY_IN)
+      {
+         continue;
+      }
+      return dealTicket;
+   }
+   Log("未找到符合条件的最新成交，返回 lastDealTicket=" + IntegerToString(lastDealTicket));
+   return lastDealTicket;
+}
+
+// 获取 ATR 值 (OnInit 调用)
 double GetATRValue(string symbol, ENUM_TIMEFRAMES timeframe, int period)
 {
    double atrArray[];
@@ -1091,4 +871,72 @@ double GetATRValue(string symbol, ENUM_TIMEFRAMES timeframe, int period)
    IndicatorRelease(atrHandle);
    return atrArray[0];
 }
+
+// 当新订单成交时更新止损 (OnTradeTransaction 调用)
+void UpdateStopLossesOnNewOrder(const MqlTradeTransaction& trans, int totalPositions)
+{
+   if(trans.price_sl <= 0)
+   {
+      Log("错误：trans.price_sl 不可用，dealTicket=" + IntegerToString(trans.deal) + 
+          ", 请检查订单是否正确设置止损");
+      return;
+   }
+
+   lastDealTicket = trans.deal;
+   lastOrderSLPrice = trans.price_sl;
+   lastPositionSLPrice = trans.price_sl; // 更新最新持仓止损价
+
+   if(!EnableMirror)
+   {
+      ENUM_POSITION_TYPE positionType = (trans.deal_type == DEAL_TYPE_BUY) ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
+
+      for(int i = totalPositions - 1; i >= 0; i--)
+      {
+         ulong ticket = PositionGetTicket(i);
+         if(!PositionSelectByTicket(ticket))
+         {
+            Log("警告：无法选择持仓以修改止损，票号=" + IntegerToString(ticket));
+            continue;
+         }
+         if(PositionGetString(POSITION_SYMBOL) != _Symbol || PositionGetInteger(POSITION_MAGIC) != MAGIC_NUMBER)
+            continue;
+
+         double currentSL = PositionGetDouble(POSITION_SL);
+         if(MathAbs(currentSL - lastOrderSLPrice) < cachedSymbolPoint)
+            continue;
+
+         trade.PositionModify(ticket, NormalizeDouble(lastOrderSLPrice, precisionDigits), 0);
+         Log("更新持仓止损：票号=" + IntegerToString(ticket) + ", 新止损=" + DoubleToString(lastOrderSLPrice, precisionDigits));
+      }
+      if(positionType == POSITION_TYPE_BUY)
+         lastBuyStopLoss = lastOrderSLPrice;
+      else
+         lastSellStopLoss = lastOrderSLPrice;
+   }
+
+   PlaceGridOrders(totalPositions);
+   Log("新订单成交处理完成：dealTicket=" + IntegerToString(trans.deal));
+}
+
+// 当止损/止盈触发时更新止损 (OnTradeTransaction 调用)
+void UpdateStopLossesOnStopTriggered(const MqlTradeTransaction& trans, int totalPositions)
+{
+   if(trans.price <= 0)
+   {
+      Log("错误：trans.price 不可用，dealTicket=" + IntegerToString(trans.deal) + 
+          ", 止损/止盈触发价格无效");
+      return;
+   }
+
+   lastOrderSLPrice = trans.price;
+   lastStopLossType = (trans.deal_type == DEAL_TYPE_BUY) ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
+   lastDealTicket = trans.deal;
+
+   PlaceGridOrders(totalPositions);
+
+   Log("止损/止盈触发处理完成：dealTicket=" + IntegerToString(trans.deal) + 
+       ", symbol=" + _Symbol + ", price=" + DoubleToString(lastOrderSLPrice, precisionDigits) + 
+       ", type=" + EnumToString(lastStopLossType));
+}
+
 //+------------------------------------------------------------------+
