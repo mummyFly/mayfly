@@ -6,28 +6,23 @@
 #ifndef MAYFLY_ADVANCED_4_0_7_MQH
 #define MAYFLY_ADVANCED_4_0_7_MQH
 
-// 开仓模式枚举（扩展部分）
-enum ENUM_TRADE_MODE_ADVANCED
+// 开仓模式枚举
+enum ENUM_TRADE_MODE
 {
+   TRADE_MODE_FIXED = 0,           // 固定手数模式
    TRADE_MODE_PERCENT = 1,         // 资金百分比模式
    TRADE_MODE_STOPLOSS_PERCENT = 2 // 止损比例开仓模式
 };
 
-// 加仓模式枚举（扩展部分）
-enum ENUM_ADD_MODE_ADVANCED
+// 加仓模式枚举
+enum ENUM_ADD_MODE
 {
-   ADD_MODE_PYRAMID = 1,    // 正金字塔加仓（底仓大，上面小）
-   ADD_MODE_INV_PYRAMID = 2 // 倒金字塔加仓（底仓小，上面大）
+   ADD_MODE_UNIFORM = 0,    // 匀速加仓（默认）
+   ADD_MODE_PYRAMID = 1,    // 正金字塔加仓
+   ADD_MODE_INV_PYRAMID = 2 // 倒金字塔加仓
 };
 
-// 输入参数（移至辅助文件）
-input double PositionPercent = 5.0;   // 百分比开仓占比
-input double StopLossPercent = 5.0;   // 止损比例占比
-input bool EnableDynamicGrid = false; // 动态网格
-
-//+------------------------------------------------------------------+
-//| 高级开仓模式的手数计算                                           |
-//+------------------------------------------------------------------+
+// 高级开仓模式的手数计算
 double CalculateLotSizeAdvanced(double stopLossDistance, double price, ENUM_TRADE_MODE tradeMode)
 {
    if(tradeMode == TRADE_MODE_FIXED)
